@@ -17,11 +17,14 @@ def determina_tipo_documento(tipo_doc):
 def processa_xml(file):
     tree = ET.parse(file)
     root = tree.getroot()
+    # Rimuove i namespace per facilitare la ricerca dei tag
     for elem in root.iter():
         if '}' in elem.tag:
             elem.tag = elem.tag.split('}', 1)[1]
 
     dati = {}
+    
+    # Estrazione Dati Fornitore
     cp = root.find(".//CedentePrestatore/DatiAnagrafici")
     if cp is not None:
         dati['P.IVA'] = cp.findtext(".//IdCodice", "")
@@ -31,6 +34,7 @@ def processa_xml(file):
             denominazione = f"{cp.findtext('.//Nome', '')} {cp.findtext('.//Cognome', '')}".strip()
         dati['DENOMINAZIONE'] = denominazione
 
+    # Estrazione Dati Generali
     dg = root.find(".//DatiGeneraliDocumento")
     if dg is not None:
         dati['NUMERO'] = dg.findtext("Numero", "")
@@ -41,6 +45,7 @@ def processa_xml(file):
         dati['TOTALE'] = float(dg.findtext("ImportoTotaleDocumento", "0").replace(",", "."))
         dati['CAUSALE'] = dg.findtext("Causale", "")
 
+    # Somma Imponibile e IVA (come da macro VBA)
     tot_imponibile = 0.0
     tot_iva = 0.0
     for riepilogo in root.findall(".//DatiRiepilogo"):
@@ -52,10 +57,12 @@ def processa_xml(file):
     dati['IMPONIBILE'] = tot_imponibile
     dati['IVA'] = tot_iva
 
+    # Ritenute
     dr = root.find(".//DatiRitenuta")
     dati['RITENUTE'] = float(dr.findtext("ImportoRitenuta", "0").replace(",", ".")) if dr is not None else 0.0
     dati['TIPO RIT.'] = dr.findtext("TipoRitenuta", "") if dr is not None else ""
 
+    # Descrizione Linee
     descrizioni = [linea.text for linea in root.findall(".//DettaglioLinee/Descrizione") if linea.text]
     full_desc = "; ".join(descrizioni)
     dati['DESCRIZIONE'] = (full_desc[:252] + '...') if len(full_desc) > 255 else full_desc
@@ -69,7 +76,7 @@ def esporta_excel_formattato(df):
         workbook = writer.book
         worksheet = writer.sheets['Fatture']
 
-        # Stili
+        # Definizione Stili (Colori Originali Macro)
         header_fill = PatternFill(start_color="C0C0C0", end_color="C0C0C0", fill_type="solid")
         font_bold = Font(bold=True)
         thin_border = Border(left=Side(style='thin'), right=Side(style='thin'), 
@@ -78,44 +85,53 @@ def esporta_excel_formattato(df):
         color_map = {
             "FATTURA": Font(color="008000", bold=True),      # Verde
             "PARCELLA": Font(color="800080", bold=True),     # Viola
-            "NOTA CREDITO": Font(color="800000", bold=True)  # Rosso scuro
+            "NOTA CREDITO": Font(color="800000", bold=True)  # Rosso/Amaranto
         }
 
-        # Blocca riquadri (Prima riga)
+        # Blocca Riquadri
         worksheet.freeze_panes = "A2"
 
-        # Intestazioni
+        # Formattazione Intestazioni
         for cell in worksheet[1]:
             cell.fill = header_fill
             cell.font = font_bold
             cell.border = thin_border
             cell.alignment = Alignment(horizontal="center")
 
-        # Dati
+        # Formattazione Dati
         for row in worksheet.iter_rows(min_row=2, max_row=len(df)+1):
             for cell in row:
                 cell.border = thin_border
-                if cell.column in range(6, 11): # Colonne Valuta
+                # Formato Valuta per colonne 6-10 (Imponibile, IVA, Totale, Ritenute, Bollo)
+                if cell.column in range(6, 11): 
                     cell.number_format = '#,##0.00 "€"'
-                if cell.column == 5: # Colore TIPO
+                # Colore condizionale per TIPO
+                if cell.column == 5:
                     valore_tipo = str(cell.value).upper()
                     if valore_tipo in color_map:
                         cell.font = color_map[valore_tipo]
+            # Formato Data
             worksheet.cell(row=row[0].row, column=4).number_format = 'DD/MM/YYYY'
 
-        # Auto-fit
+        # Auto-fit Colonne
         for column in worksheet.columns:
-            max_length = max(len(str(cell.value or "")) for cell in column)
-            worksheet.column_dimensions[column[0].column_letter].width = max_length + 2
+            max_length = 0
+            column_letter = column[0].column_letter
+            for cell in column:
+                try:
+                    if cell.value and len(str(cell.value)) > max_length:
+                        max_length = len(str(cell.value))
+                except: pass
+            worksheet.column_dimensions[column_letter].width = max_length + 2
 
     return output.getvalue()
 
-# --- INTERFACCIA STREAMLIT ---
+# --- INTERFACCIA WEB STREAMLIT ---
 
 st.set_page_config(page_title="Convertitore XML", layout="wide")
 st.title("📂 Elaborazione Fatture XML")
 
-uploaded_files = st.file_uploader("Carica i tuoi file XML", type="xml", accept_multiple_files=True)
+uploaded_files = st.file_uploader("Trascina qui i tuoi file XML", type="xml", accept_multiple_files=True)
 
 if uploaded_files:
     lista_finale = []
@@ -124,11 +140,33 @@ if uploaded_files:
     for f in uploaded_files:
         try:
             d = processa_xml(f)
-            # Controllo duplicati: P.IVA + Numero + Anno
-            anno = d['DATA'].year if d['DATA'] else ""
-            chiave = (d['P.IVA'], d['NUMERO'], anno)
+            # Controllo duplicati: P.IVA + Numero + Anno (come da Macro)
+            anno_fatt = d['DATA'].year if d['DATA'] else ""
+            chiave = (d['P.IVA'], d['NUMERO'], anno_fatt)
             
             if chiave not in visti:
                 lista_finale.append(d)
                 visti.add(chiave)
             else:
+                st.warning(f"Duplicato ignorato: {d['NOME FILE']} (P.IVA {d['P.IVA']} - Num. {d['NUMERO']})")
+        except Exception as e:
+            st.error(f"Errore nell'elaborazione di {f.name}: {e}")
+
+    if lista_finale:
+        df = pd.DataFrame(lista_finale)
+        # Ordine colonne come da richiesta originale
+        cols = ["P.IVA", "DENOMINAZIONE", "NUMERO", "DATA", "TIPO", "IMPONIBILE", "IVA", "TOTALE", "RITENUTE", "BOLLO", "TIPO RIT.", "CAUSALE", "COD.FISC", "DESCRIZIONE", "NOME FILE"]
+        df = df[cols]
+        
+        st.subheader("Anteprima Elaborazione")
+        st.dataframe(df)
+        
+        # Generazione file Excel formattato
+        excel_data = esporta_excel_formattato(df)
+        
+        st.download_button(
+            label="📥 Scarica Excel Formattato",
+            data=excel_data,
+            file_name="estrazione_fatture.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
